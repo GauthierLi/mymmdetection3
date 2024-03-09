@@ -196,9 +196,11 @@ test_evaluator = val_evaluator
 embed_multi = dict(lr_mult=1.0, decay_mult=0.0)
 optim_wrapper = dict(
     type='OptimWrapper',
+    # 累加 4 次参数更新一次
+    accumulative_counts=4,
     optimizer=dict(
         type='AdamW',
-        lr=0.0001,
+        lr=5e-5,
         weight_decay=0.05,
         eps=1e-8,
         betas=(0.9, 0.999)),
@@ -213,25 +215,27 @@ optim_wrapper = dict(
     clip_grad=dict(max_norm=0.01, norm_type=2))
 
 # learning policy
-max_iters = 368750
+max_epochs = 12
+iter_per_epoch = 118000
+
+# learning rate
 param_scheduler = dict(
-    type='MultiStepLR',
-    begin=0,
-    end=max_iters,
-    by_epoch=False,
-    milestones=[327778, 355092],
-    gamma=0.1)
+        type='CosineRestartLR',
+        begin=0,
+        periods=[2*iter_per_epoch, 4*iter_per_epoch, 6*iter_per_epoch],
+        by_epoch=False,
+        restart_weights=[1, 0.5, 0.25],
+        eta_min_ratio=1e-4,
+    )
 
 # Before 365001th iteration, we do evaluation every 5000 iterations.
 # After 365000th iteration, we do evaluation every 368750 iterations,
 # which means that we do evaluation at the end of training.
 interval = 5000
-dynamic_intervals = [(max_iters // interval * interval + 1, max_iters)]
-train_cfg = dict(
-    type='IterBasedTrainLoop',
-    max_iters=max_iters,
-    val_interval=interval,
-    dynamic_intervals=dynamic_intervals)
+# training schedule for 1x
+train_cfg = dict(type='EpochBasedTrainLoop', 
+                 max_epochs=max_epochs, 
+                 val_interval=1)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
@@ -239,10 +243,11 @@ default_hooks = dict(
     logger=dict(log_metric_by_epoch=False),
     checkpoint=dict(
         type='CheckpointHook',
-        by_epoch=False,
+        by_epoch=True,
         save_last=True,
+        save_best='auto',
         max_keep_ckpts=3,
-        interval=interval))
+        interval=1))
 log_processor = dict(type='LogProcessor', window_size=50, by_epoch=False)
 
 # Default setting for scaling LR automatically

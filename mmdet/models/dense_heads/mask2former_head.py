@@ -1,6 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import torch
 import torch.nn as nn
@@ -13,9 +13,9 @@ from torch import Tensor
 
 from mmdet.registry import MODELS, TASK_UTILS
 from mmdet.structures import SampleList
-from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig, reduce_mean
+from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig, reduce_mean, shape_noise_generate, step_add_noise
 from ..layers import Mask2FormerTransformerDecoder, SinePositionalEncoding
-from ..utils import get_uncertain_point_coords_with_randomness
+from ..utils import get_uncertain_point_coords_with_randomness, multi_apply
 from .anchor_free_head import AnchorFreeHead
 from .maskformer_head import MaskFormerHead
 
@@ -72,6 +72,9 @@ class Mask2FormerHead(MaskFormerHead):
                  transformer_decoder: ConfigType = ...,
                  positional_encoding: ConfigType = dict(
                      num_feats=128, normalize=True),
+                 denoise: bool = False,
+                 num_denoising_queries=100,
+                 denoise_coefficient=0.2,
                  loss_cls: ConfigType = dict(
                      type='CrossEntropyLoss',
                      use_sigmoid=False,
@@ -127,7 +130,10 @@ class Mask2FormerHead(MaskFormerHead):
                 self.decoder_input_projs.append(nn.Identity())
         self.decoder_positional_encoding = SinePositionalEncoding(
             **positional_encoding)
-        self.query_embed = nn.Embedding(self.num_queries, feat_channels)
+        if denoise:
+            self.query_embed = nn.Embedding(self.num_queries + num_denoising_queries, feat_channels)
+        else:
+            self.query_embed = nn.Embedding(self.num_queries, feat_channels)
         self.query_feat = nn.Embedding(self.num_queries, feat_channels)
         # from low resolution to high resolution
         self.level_embed = nn.Embedding(self.num_transformer_feat_level,
@@ -155,6 +161,12 @@ class Mask2FormerHead(MaskFormerHead):
         self.loss_mask = MODELS.build(loss_mask)
         self.loss_dice = MODELS.build(loss_dice)
 
+        # denoise settings
+        self.denoise = denoise
+        self.num_denoising_queries = num_denoising_queries
+        self.denoise_coefficient = denoise_coefficient
+        self.denoise_label_embedding = nn.Embedding(num_things_classes, feat_channels)
+
     def init_weights(self) -> None:
         for m in self.decoder_input_projs:
             if isinstance(m, Conv2d):
@@ -168,7 +180,8 @@ class Mask2FormerHead(MaskFormerHead):
 
     def _get_targets_single(self, cls_score: Tensor, mask_pred: Tensor,
                             gt_instances: InstanceData,
-                            img_meta: dict) -> Tuple[Tensor]:
+                            img_meta: dict,
+                            **kwargs) -> Tuple[Tensor]:
         """Compute classification and mask targets for one image.
 
         Args:
@@ -197,6 +210,12 @@ class Mask2FormerHead(MaskFormerHead):
                     image.
                 - sampling_result (:obj:`SamplingResult`): Sampling results.
         """
+        denoise = kwargs.get('denoise', None)
+        if denoise:
+            new_gt_instances = InstanceData()
+            new_gt_instances.labels = gt_instances.denoise_labels
+            new_gt_instances.masks = gt_instances.denoise_masks
+            gt_instances = new_gt_instances
         gt_labels = gt_instances.labels
         gt_masks = gt_instances.masks
         # sample points
@@ -228,6 +247,8 @@ class Mask2FormerHead(MaskFormerHead):
             assign_result=assign_result,
             pred_instances=pred_instances,
             gt_instances=gt_instances)
+        if denoise:
+            sampling_result.pos_assigned_gt_inds = sampling_result.pos_inds
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
 
@@ -248,7 +269,8 @@ class Mask2FormerHead(MaskFormerHead):
 
     def _loss_by_feat_single(self, cls_scores: Tensor, mask_preds: Tensor,
                              batch_gt_instances: List[InstanceData],
-                             batch_img_metas: List[dict]) -> Tuple[Tensor]:
+                             batch_img_metas: List[dict],
+                             denoise: bool = False) -> Tuple[Tensor]:
         """Loss function for outputs from a single decoder layer.
 
         Args:
@@ -271,7 +293,8 @@ class Mask2FormerHead(MaskFormerHead):
         mask_preds_list = [mask_preds[i] for i in range(num_imgs)]
         (labels_list, label_weights_list, mask_targets_list, mask_weights_list,
          avg_factor) = self.get_targets(cls_scores_list, mask_preds_list,
-                                        batch_gt_instances, batch_img_metas)
+                                        batch_gt_instances, batch_img_metas, 
+                                        denoise=denoise)
         # shape (batch_size, num_queries)
         labels = torch.stack(labels_list, dim=0)
         # shape (batch_size, num_queries)
@@ -335,7 +358,8 @@ class Mask2FormerHead(MaskFormerHead):
         return loss_cls, loss_mask, loss_dice
 
     def _forward_head(self, decoder_out: Tensor, mask_feature: Tensor,
-                      attn_mask_target_size: Tuple[int, int]) -> Tuple[Tensor]:
+                      attn_mask_target_size: Tuple[int, int],
+                      **kwargs) -> Tuple[Tensor]:
         """Forward for head part which is called after every decoder layer.
 
         Args:
@@ -355,6 +379,7 @@ class Mask2FormerHead(MaskFormerHead):
                 - attn_mask (Tensor): Attention mask in shape \
                     (batch_size * num_heads, num_queries, h, w).
         """
+        noise_gt_mask = kwargs.get('noise_gt_mask', None)
         decoder_out = self.transformer_decoder.post_norm(decoder_out)
         # shape (num_queries, batch_size, c)
         cls_pred = self.cls_embed(decoder_out)
@@ -367,17 +392,130 @@ class Mask2FormerHead(MaskFormerHead):
             attn_mask_target_size,
             mode='bilinear',
             align_corners=False)
+        
+        if noise_gt_mask is not None:
+            denoise_attn_mask = F.interpolate(
+                noise_gt_mask,
+                attn_mask_target_size,
+                mode='nearest',
+                align_corners=None)
+            # denoise part first
+            attn_mask = torch.concat([denoise_attn_mask, 
+                attn_mask[:,-self.num_queries:,:,:].sigmoid()], dim=1)
+            
+            # ATTN_MASK for self attension
+            self_attn_mask = torch.zeros((attn_mask.size(0),) + 
+                    (self.num_heads, 
+                    self.num_denoising_queries+self.num_queries, 
+                    self.num_denoising_queries+self.num_queries),
+                    device=attn_mask.device, dtype=attn_mask.dtype)
+            self_attn_mask[:,:,:self.num_denoising_queries,:self.num_denoising_queries] = 1
+            self_attn_mask[:,:,self.num_denoising_queries:,self.num_denoising_queries:] = 1
+            self_attn_mask = self_attn_mask.flatten(0, 1)
+            self_attn_mask = self_attn_mask < 0.5
         # shape (num_queries, batch_size, h, w) ->
         #   (batch_size * num_head, num_queries, h, w)
         attn_mask = attn_mask.flatten(2).unsqueeze(1).repeat(
             (1, self.num_heads, 1, 1)).flatten(0, 1)
-        attn_mask = attn_mask.sigmoid() < 0.5
+        if noise_gt_mask is not None:
+            attn_mask = attn_mask < 0.5
+        else:
+            attn_mask = attn_mask.sigmoid() < 0.5
         attn_mask = attn_mask.detach()
 
+        if noise_gt_mask is not None:
+            return cls_pred, mask_pred, attn_mask, self_attn_mask
         return cls_pred, mask_pred, attn_mask
+    
+    def loss_by_feat(self, all_cls_scores: Tensor, all_mask_preds: Tensor,
+                     batch_gt_instances: List[InstanceData],
+                     batch_img_metas: List[dict], **kwargs) -> Dict[str, Tensor]:
+        """Loss function.
+
+        Args:
+            all_cls_scores (Tensor): Classification scores for all decoder
+                layers with shape (num_decoder, batch_size, num_queries,
+                cls_out_channels). Note `cls_out_channels` should includes
+                background.
+            all_mask_preds (Tensor): Mask scores for all decoder layers with
+                shape (num_decoder, batch_size, num_queries, h, w).
+            batch_gt_instances (list[obj:`InstanceData`]): each contains
+                ``labels`` and ``masks``.
+            batch_img_metas (list[dict]): List of image meta information.
+
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components.
+        """
+        loss_dict = dict()
+        num_dec_layers = len(all_cls_scores)
+        batch_gt_instances_list = [
+            batch_gt_instances for _ in range(num_dec_layers)
+        ]
+        batch_denoise_gt_instances = kwargs.get('batch_denoise_gt_instances', None)
+        if batch_denoise_gt_instances is not None:
+            batch_denoise_gt_instances_list = [
+                batch_denoise_gt_instances for _ in range(num_dec_layers)
+            ]
+            img_metas_list = [batch_img_metas for _ in range(num_dec_layers)]
+            normal_cls_scores = [score[:,self.num_denoising_queries:,:] 
+                                 for score in all_cls_scores]
+            denoise_cls_scores = [score[:,:self.num_denoising_queries,:] 
+                                 for score in all_cls_scores]
+            normal_mask_preds = [mask_pred[:,self.num_denoising_queries:,:,:] 
+                                 for mask_pred in all_mask_preds]
+            denoise_mask_preds = [mask_pred[:,:self.num_denoising_queries,:,:] 
+                                 for mask_pred in all_mask_preds]
+            losses_cls, losses_mask, losses_dice = multi_apply(
+                self._loss_by_feat_single, normal_cls_scores, normal_mask_preds,
+                batch_gt_instances_list, img_metas_list)
+            losses_cls_denoise, losses_mask_denoise, losses_dice_denoise = multi_apply(
+                self._loss_by_feat_single, denoise_cls_scores, denoise_mask_preds,
+                batch_denoise_gt_instances_list, img_metas_list, 
+                [True for _ in range(num_dec_layers)])
+            # loss from the last decoder layer
+            loss_dict['loss_cls'] = losses_cls[-1]
+            loss_dict['loss_mask'] = losses_mask[-1]
+            loss_dict['loss_dice'] = losses_dice[-1]
+
+            loss_dict['loss_cls_denoise'] = losses_cls_denoise[-1]
+            loss_dict['loss_mask_denoise'] = losses_mask_denoise[-1]
+            loss_dict['loss_dice_denoise'] = losses_dice_denoise[-1]
+            # loss from other decoder layers
+            num_dec_layer = 0
+            for loss_cls_i, loss_mask_i, loss_dice_i, \
+                loss_cls_denoise_i, loss_mask_denoise_i, loss_dice_denoise_i in zip(
+                    losses_cls[:-1], losses_mask[:-1], losses_dice[:-1],
+                    losses_cls_denoise[:-1], losses_mask_denoise[:-1], losses_dice_denoise[:-1]):
+                loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
+                loss_dict[f'd{num_dec_layer}.loss_mask'] = loss_mask_i
+                loss_dict[f'd{num_dec_layer}.loss_dice'] = loss_dice_i
+                loss_dict[f'd{num_dec_layer}.loss_cls_denoise'] = loss_cls_denoise_i
+                loss_dict[f'd{num_dec_layer}.loss_mask_denoise'] = loss_mask_denoise_i
+                loss_dict[f'd{num_dec_layer}.loss_dice_denoise'] = loss_dice_denoise_i
+                num_dec_layer += 1
+        else:
+            img_metas_list = [batch_img_metas for _ in range(num_dec_layers)]
+            losses_cls, losses_mask, losses_dice = multi_apply(
+                self._loss_by_feat_single, all_cls_scores, all_mask_preds,
+                batch_gt_instances_list, img_metas_list)
+
+            # loss from the last decoder layer
+            loss_dict['loss_cls'] = losses_cls[-1]
+            loss_dict['loss_mask'] = losses_mask[-1]
+            loss_dict['loss_dice'] = losses_dice[-1]
+            # loss from other decoder layers
+            num_dec_layer = 0
+            for loss_cls_i, loss_mask_i, loss_dice_i in zip(
+                    losses_cls[:-1], losses_mask[:-1], losses_dice[:-1]):
+                loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
+                loss_dict[f'd{num_dec_layer}.loss_mask'] = loss_mask_i
+                loss_dict[f'd{num_dec_layer}.loss_dice'] = loss_dice_i
+                num_dec_layer += 1
+        return loss_dict
 
     def forward(self, x: List[Tensor],
-                batch_data_samples: SampleList) -> Tuple[List[Tensor]]:
+                batch_data_samples: SampleList,
+                **kwargs) -> Tuple[List[Tensor]]:
         """Forward function.
 
         Args:
@@ -398,6 +536,7 @@ class Mask2FormerHead(MaskFormerHead):
                     decoder layer. Each with shape (batch_size, num_queries, \
                     h, w).
         """
+        batch_denoise_gt_instances = kwargs.get('batch_denoise_gt_instances', None)
         batch_size = x[0].shape[0]
         mask_features, multi_scale_memorys = self.pixel_decoder(x)
         # multi_scale_memorys (from low resolution to high resolution)
@@ -424,11 +563,29 @@ class Mask2FormerHead(MaskFormerHead):
             (batch_size, 1, 1))
         query_embed = self.query_embed.weight.unsqueeze(0).repeat(
             (batch_size, 1, 1))
+        if batch_denoise_gt_instances is None and self.denoise:
+            query_embed = query_embed[:,self.num_queries:,:]
 
         cls_pred_list = []
         mask_pred_list = []
-        cls_pred, mask_pred, attn_mask = self._forward_head(
-            query_feat, mask_features, multi_scale_memorys[0].shape[-2:])
+        if batch_denoise_gt_instances is not None:
+            denoise_masks_list = [batch_data.denoise_masks for batch_data in batch_denoise_gt_instances]
+            denoise_labels_list = [batch_data.denoise_labels for batch_data in batch_denoise_gt_instances]
+            denoise_gt_masks = torch.stack(denoise_masks_list, dim=0)
+            denoise_gt_labels = torch.stack(denoise_labels_list, dim=0)
+
+            noise = shape_noise_generate(denoise_gt_masks.shape, 
+                                         self.num_transformer_decoder_layers+1, 
+                                         self.denoise_coefficient)
+            noise_gt_masks = step_add_noise(denoise_gt_masks, noise)
+            noise_gt_labels = self.denoise_label_embedding(denoise_gt_labels)
+            query_feat = torch.concat([noise_gt_labels, query_feat], dim=1)
+            cls_pred, mask_pred, attn_mask, self_attn_mask = self._forward_head(
+                query_feat, mask_features, multi_scale_memorys[0].shape[-2:], 
+                noise_gt_mask = noise_gt_masks[0])
+        else:
+            cls_pred, mask_pred, attn_mask = self._forward_head(
+                query_feat, mask_features, multi_scale_memorys[0].shape[-2:])
         cls_pred_list.append(cls_pred)
         mask_pred_list.append(mask_pred)
 
@@ -439,6 +596,8 @@ class Mask2FormerHead(MaskFormerHead):
             attn_mask = attn_mask & mask_sum
             # cross_attn + self_attn
             layer = self.transformer_decoder.layers[i]
+            if batch_denoise_gt_instances is None:
+                self_attn_mask = None
             query_feat = layer(
                 query=query_feat,
                 key=decoder_inputs[level_idx],
@@ -446,12 +605,19 @@ class Mask2FormerHead(MaskFormerHead):
                 query_pos=query_embed,
                 key_pos=decoder_positional_encodings[level_idx],
                 cross_attn_mask=attn_mask,
+                self_attn_mask=self_attn_mask,
                 query_key_padding_mask=None,
                 # here we do not apply masking on padded region
                 key_padding_mask=None)
-            cls_pred, mask_pred, attn_mask = self._forward_head(
+            if batch_denoise_gt_instances is not None:
+                cls_pred, mask_pred, attn_mask, self_attn_mask = self._forward_head(
                 query_feat, mask_features, multi_scale_memorys[
-                    (i + 1) % self.num_transformer_feat_level].shape[-2:])
+                    (i + 1) % self.num_transformer_feat_level].shape[-2:],
+                    noise_gt_mask = noise_gt_masks[i+1])
+            else:
+                cls_pred, mask_pred, attn_mask = self._forward_head(
+                    query_feat, mask_features, multi_scale_memorys[
+                        (i + 1) % self.num_transformer_feat_level].shape[-2:])
 
             cls_pred_list.append(cls_pred)
             mask_pred_list.append(mask_pred)

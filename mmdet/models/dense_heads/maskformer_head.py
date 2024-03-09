@@ -2,6 +2,7 @@
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.cnn import Conv2d
@@ -13,7 +14,7 @@ from mmdet.models.layers.pixel_decoder import PixelDecoder
 from mmdet.registry import MODELS, TASK_UTILS
 from mmdet.structures import SampleList
 from mmdet.utils import (ConfigType, InstanceList, OptConfigType,
-                         OptMultiConfig, reduce_mean)
+                         OptMultiConfig, reduce_mean, generate_random_mask)
 from ..layers import DetrTransformerDecoder, SinePositionalEncoding
 from ..utils import multi_apply, preprocess_panoptic_gt
 from .anchor_free_head import AnchorFreeHead
@@ -195,8 +196,8 @@ class MaskFormerHead(AnchorFreeHead):
         mask_preds_list: List[Tensor],
         batch_gt_instances: InstanceList,
         batch_img_metas: List[dict],
-        return_sampling_results: bool = False
-    ) -> Tuple[List[Union[Tensor, int]]]:
+        return_sampling_results: bool = False,
+        **kwargs) -> Tuple[List[Union[Tensor, int]]]:
         """Compute classification and mask targets for all images for a decoder
         layer.
 
@@ -234,9 +235,15 @@ class MaskFormerHead(AnchorFreeHead):
                 to properties at each feature map (i.e. having HxW dimension).
                 The results will be concatenated after the end.
         """
-        results = multi_apply(self._get_targets_single, cls_scores_list,
-                              mask_preds_list, batch_gt_instances,
-                              batch_img_metas)
+        if denoise := kwargs.get('denoise', False):
+            denoise_list = [denoise for _ in range(len(cls_scores_list))]
+            results = multi_apply(self._get_targets_single, cls_scores_list,
+                                mask_preds_list, batch_gt_instances,
+                                batch_img_metas, denoise=denoise_list)
+        else:
+            results = multi_apply(self._get_targets_single, cls_scores_list,
+                                mask_preds_list, batch_gt_instances,
+                                batch_img_metas)
         (labels_list, label_weights_list, mask_targets_list, mask_weights_list,
          pos_inds_list, neg_inds_list, sampling_results_list) = results[:7]
         rest_results = list(results[7:])
@@ -550,18 +557,40 @@ class MaskFormerHead(AnchorFreeHead):
             else:
                 batch_gt_semantic_segs.append(None)
 
-        # forward
-        all_cls_scores, all_mask_preds = self(x, batch_data_samples)
-
-        # preprocess ground truth
-        batch_gt_instances = self.preprocess_gt(batch_gt_instances,
-                                                batch_gt_semantic_segs)
-
         # loss
-        losses = self.loss_by_feat(all_cls_scores, all_mask_preds,
+        if hasattr(self, "denoise") and self.denoise:
+            # preprocess ground truth
+            batch_gt_instances = self.preprocess_gt(batch_gt_instances,
+                                                    batch_gt_semantic_segs)
+            batch_denoise_gt_instances = self.get_denoise_gt_instances(batch_gt_instances)
+            # forward
+            all_cls_scores, all_mask_preds = self(x, batch_data_samples, 
+                                                  batch_denoise_gt_instances=batch_denoise_gt_instances)
+            losses = self.loss_by_feat(all_cls_scores, all_mask_preds,
+                                   batch_gt_instances, batch_img_metas, 
+                                   batch_denoise_gt_instances=batch_denoise_gt_instances)
+        else:
+            # forward
+            all_cls_scores, all_mask_preds = self(x, batch_data_samples)
+
+            # preprocess ground truth
+            batch_gt_instances = self.preprocess_gt(batch_gt_instances,
+                                                    batch_gt_semantic_segs)
+            losses = self.loss_by_feat(all_cls_scores, all_mask_preds,
                                    batch_gt_instances, batch_img_metas)
 
         return losses
+    
+    def get_denoise_gt_instances(self, batch_gt_instances):
+        gt_labels, gt_masks = [gt_instance.labels for gt_instance in batch_gt_instances], \
+            [gt_instance.masks for gt_instance in batch_gt_instances]
+        batch_denoise_masks, batch_denoise_labels = generate_random_mask(gt_masks_list=gt_masks, 
+            gt_labels_list=gt_labels, number_of_query=self.num_denoising_queries, shape=(256,256))
+        batch_denoise_gt_instances = []
+        for i, (denoise_masks, denoise_labels) in enumerate(tuple(zip(batch_denoise_masks, batch_denoise_labels))):
+            denoise_gt = {"denoise_masks": denoise_masks, "denoise_labels": denoise_labels}
+            batch_denoise_gt_instances.append(InstanceData(**denoise_gt))
+        return batch_denoise_gt_instances
 
     def predict(self, x: Tuple[Tensor],
                 batch_data_samples: SampleList) -> Tuple[Tensor]:

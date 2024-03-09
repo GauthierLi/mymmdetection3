@@ -28,6 +28,8 @@ model = dict(
     panoptic_head=dict(
         num_things_classes=num_things_classes,
         num_stuff_classes=num_stuff_classes,
+        denoise=True,
+        num_denoising_queries=100,
         loss_cls=dict(class_weight=[1.0] * num_classes + [0.1])),
     panoptic_fusion_head=dict(
         num_things_classes=num_things_classes,
@@ -100,3 +102,47 @@ val_evaluator = dict(
     format_only=False,
     backend_args={{_base_.backend_args}})
 test_evaluator = val_evaluator
+
+# learning policy
+max_iters = 368750
+param_scheduler = dict(
+    type='MultiStepLR',
+    begin=0,
+    end=max_iters,
+    by_epoch=False,
+    milestones=[int(max_iters * 0.88), int(max_iters * 0.95)],
+    gamma=0.1)
+
+# Before 365001th iteration, we do evaluation every 5000 iterations.
+# After 365000th iteration, we do evaluation every 368750 iterations,
+# which means that we do evaluation at the end of training.
+interval = 5000
+dynamic_intervals = [(max_iters // interval * interval + 1, max_iters)]
+train_cfg = dict(
+    type='IterBasedTrainLoop',
+    max_iters=max_iters,
+    val_interval=interval,
+    dynamic_intervals=dynamic_intervals)
+val_cfg = dict(type='ValLoop')
+test_cfg = dict(type='TestLoop')
+
+# optimizer
+embed_multi = dict(lr_mult=1.0, decay_mult=0.0)
+optim_wrapper = dict(
+    type='OptimWrapper',
+    # accumulative_counts=8,
+    optimizer=dict(
+        type='AdamW',
+        lr=0.0001,
+        weight_decay=0.05,
+        eps=1e-8,
+        betas=(0.9, 0.999)),
+    paramwise_cfg=dict(
+        custom_keys={
+            'backbone': dict(lr_mult=0.1, decay_mult=1.0),
+            'query_embed': embed_multi,
+            'query_feat': embed_multi,
+            'level_embed': embed_multi,
+        },
+        norm_decay_mult=0.0),
+    clip_grad=dict(max_norm=0.01, norm_type=2))

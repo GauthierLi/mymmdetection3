@@ -1,4 +1,4 @@
-_base_ = ['./mask2former_r50_8xb2-lsj-50e_coco-panoptic.py']
+_base_ = ['./dn_mask2former_r50_epoch_base_coco-panoptic.py']
 
 num_things_classes = 80
 num_stuff_classes = 0
@@ -28,6 +28,8 @@ model = dict(
     panoptic_head=dict(
         num_things_classes=num_things_classes,
         num_stuff_classes=num_stuff_classes,
+        denoise=True,
+        num_denoising_queries=100,
         loss_cls=dict(class_weight=[1.0] * num_classes + [0.1])),
     panoptic_fusion_head=dict(
         num_things_classes=num_things_classes,
